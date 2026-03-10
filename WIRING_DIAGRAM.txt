@@ -1,0 +1,183 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                    ESP32-P4 to PN532 NFC Wiring Diagram                   ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────┐                    ┌─────────────────────────┐
+│   ESP32-P4 (Waveshare)  │                    │      PN532 NFC Board    │
+│  ESP32-P4-WIFI6-POE-ETH │                    │                         │
+├─────────────────────────┤                    ├─────────────────────────┤
+│                         │                    │                         │
+│  GPIO20 (SCK)  ─────────┼────────────────────┼─────→ SCK               │
+│                         │                    │                         │
+│  GPIO21 (MOSI) ─────────┼────────────────────┼─────→ MOSI (SDI)       │
+│                         │                    │                         │
+│  GPIO22 (MISO) ←────────┼────────────────────┼───── MISO (SDO)        │
+│                         │                    │                         │
+│  GPIO23 (CS)   ─────────┼────────────────────┼─────→ SS / NSS         │
+│                         │                    │                         │
+│  3.3V or 5V    ─────────┼────────────────────┼─────→ VCC               │
+│                         │                    │                         │
+│  GND           ─────────┼────────────────────┼─────→ GND               │
+│                         │                    │                         │
+│  GPIO24 (opt)  ─────────┼────────────────────┼─────→ RSTPD_N (opt)    │
+│                         │                    │                         │
+└─────────────────────────┘                    └─────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+CRITICAL: PN532 DIP SWITCH CONFIGURATION
+
+    ┌─────────────────┐
+    │  PN532 Board    │
+    │                 │
+    │   SW1    SW2    │
+    │   ┌─┐    ┌─┐   │
+    │   │█│    │ │   │  ← SW1 = ON  (towards ON marking)
+    │   │ │    │█│   │  ← SW2 = OFF (towards OFF marking)
+    │   └─┘    └─┘   │
+    │   ON     ON     │
+    │   OFF    OFF    │
+    └─────────────────┘
+
+This selects SPI mode. Wrong settings = PN532 won't respond!
+
+═══════════════════════════════════════════════════════════════════════════
+
+POWER SUPPLY OPTIONS
+
+Option 1: 3.3V Supply (if PN532 board has 3.3V regulator)
+    ESP32-P4 3.3V ──→ PN532 VCC
+
+Option 2: 5V Supply (if PN532 board requires 5V)
+    External 5V ──→ PN532 VCC
+    (Check your PN532 board specifications!)
+
+⚠️  IMPORTANT: Some PN532 boards have a voltage selection jumper.
+    Make sure it matches your power supply voltage!
+
+═══════════════════════════════════════════════════════════════════════════
+
+OPTIONAL: HARDWARE RESET CONNECTION
+
+For maximum reliability, connect reset pin:
+
+    ESP32-P4 GPIO24 ──→ PN532 RSTPD_N
+
+Then update main/config.h:
+    #define NFC_RST_PIN     GPIO_NUM_24
+
+═══════════════════════════════════════════════════════════════════════════
+
+WIRE LENGTH RECOMMENDATIONS
+
+✅ GOOD: < 20 cm (8 inches)
+⚠️  OK:   20-50 cm (8-20 inches) - may need lower SPI speed
+❌ BAD:  > 50 cm (20 inches) - expect communication errors
+
+For long wires:
+- Use twisted pairs (SCK+GND, MOSI+GND, MISO+GND)
+- Add 0.1µF capacitors near PN532 VCC and GND
+- Reduce SPI frequency in config.h to 500 kHz
+
+═══════════════════════════════════════════════════════════════════════════
+
+SIGNAL QUALITY TIPS
+
+1. Keep SPI wires away from:
+   - Power supply wires
+   - Motor wires
+   - High-current traces
+
+2. Use solid connections:
+   - Solder if possible
+   - Quality jumper wires
+   - Avoid breadboards for final installation
+
+3. Add decoupling capacitor:
+   - 0.1µF ceramic capacitor
+   - Place close to PN532 VCC and GND pins
+   - Short leads
+
+═══════════════════════════════════════════════════════════════════════════
+
+TESTING CONNECTIONS
+
+Use a multimeter to verify:
+
+1. Power:
+   PN532 VCC to GND: Should read 3.3V or 5V (stable)
+
+2. Ground:
+   ESP32 GND to PN532 GND: Should read 0Ω (continuity)
+
+3. CS idle state:
+   ESP32 GPIO23 to GND: Should read ~3.3V when idle
+
+4. SPI signals (with oscilloscope/logic analyzer):
+   - SCK: Square wave at 1 MHz during communication
+   - MOSI/MISO: Data transitions synchronized with SCK
+   - CS: Goes LOW before SCK starts
+
+═══════════════════════════════════════════════════════════════════════════
+
+COMMON WIRING MISTAKES
+
+❌ MISO and MOSI swapped
+   → Symptom: STATUS wire byte = 0xFF or 0x00
+
+❌ CS not connected
+   → Symptom: STATUS wire byte = 0xFF 0xFF
+
+❌ Wrong DIP switches
+   → Symptom: PN532 not responding at all
+
+❌ Poor ground connection
+   → Symptom: Intermittent detection, "Bad ACK" errors
+
+❌ Insufficient power supply
+   → Symptom: PN532 resets when RF field activates
+
+❌ Long wires without proper termination
+   → Symptom: Communication errors, unreliable detection
+
+═══════════════════════════════════════════════════════════════════════════
+
+FULL SYSTEM WIRING (All Peripherals)
+
+ESP32-P4 Waveshare Board Connections:
+
+NFC Reader (PN532):
+  GPIO20 → SCK
+  GPIO21 → MOSI
+  GPIO22 → MISO
+  GPIO23 → CS
+
+Barcode Scanner (GM805):
+  GPIO4 → RX
+  GPIO5 → TX
+
+Audio (ES8311 + NS4150B):
+  GPIO7  → I2C SDA
+  GPIO8  → I2C SCL
+  GPIO9  → I2S DOUT (to ES8311 DSDIN)
+  GPIO10 → I2S LRCK
+  GPIO11 → I2S DIN (from ES8311 ASDOUT)
+  GPIO12 → I2S BCLK
+  GPIO13 → I2S MCLK
+  GPIO53 → PA_CTRL (amp enable)
+
+LEDs:
+  GPIO1 → Green LED
+  GPIO2 → Red LED
+
+Ethernet (IP101 PHY):
+  GPIO31 → MDC
+  GPIO52 → MDIO
+  GPIO51 → PHY_RST
+
+═══════════════════════════════════════════════════════════════════════════
+
+For more help, see:
+- NFC_TROUBLESHOOTING.md - Detailed troubleshooting guide
+- BUILD_AND_FLASH.md - Build and flash instructions
+- QUICK_START.md - Quick start guide

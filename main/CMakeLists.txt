@@ -1,0 +1,27 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "audio.c"
+        "pn532_spi.c"
+        "gm805_uart.c"
+        "eth_ip101.c"
+        "telnet_server.c"
+        "access_check.c"
+        "ota.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_driver_i2s
+        esp_driver_i2c
+        esp_driver_spi
+        esp_driver_uart
+        esp_driver_gpio
+        esp_eth
+        esp_netif
+        esp_http_client
+        app_update
+        lwip
+        json
+        nvs_flash
+        esp_timer
+        esp_rom
+)
