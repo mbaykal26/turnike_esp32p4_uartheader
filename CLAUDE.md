@@ -23,9 +23,9 @@ First build downloads `espressif/esp_codec_dev` from the component registry.
 
 | Peripheral | Signal | GPIO | Notes |
 |-----------|--------|------|-------|
-| PN532 NFC | SCK | 20 | SPI2_HOST, 1 MHz, LSB-first |
-| | MISO | 21 | |
-| | MOSI | 22 | |
+| PN532 NFC | SCK | 20 | SPI2_HOST, 1 MHz, software bit-reversal |
+| | MISO | 22 | |
+| | MOSI | 21 | |
 | | CS | 23 | Active LOW |
 | GM805 Barcode | RX | 4 | UART1, 115200 baud |
 | | TX | 5 | |
@@ -37,7 +37,7 @@ First build downloads `espressif/esp_codec_dev` from the component registry.
 | | **DOUT** | **9** | → ES8311 DSDIN (DAC) ← KEY PIN |
 | | DIN | 11 | ← ES8311 ASDOUT (ADC) |
 | NS4150B Amp | PA_CTRL | 53 | HIGH = amp ON |
-| LED Green | OUT | 1 | |
+| LED Green | OUT | 1 | Door open signal |
 | LED Red | OUT | 2 | |
 | IP101 PHY | MDC | 31 | Ethernet management |
 | | MDIO | 52 | |
@@ -49,14 +49,12 @@ From the **ESP32 I2S driver's perspective**, it is the opposite:
 - ESP32 I2S `dout` (what the ESP32 **sends**) = **GPIO9** → goes into ES8311's DSDIN (DAC input)
 - Setting `dout=GPIO11` would push audio into the ADC output pin → **silence**
 
-### Optional: GM805 alternative pins
-If GPIO37(TXD)/GPIO38(RXD) on the header are not wired to the USB-UART bridge chip:
-```c
-// In config.h, change only these two lines:
-#define BARCODE_RX_PIN   GPIO_NUM_38
-#define BARCODE_TX_PIN   GPIO_NUM_37
-```
-Verify by checking if `idf.py monitor` still prints after changing (no UART conflict).
+### ⚠️ UART Pin Conflict — Serial Monitor Goes Silent After Startup Beep
+GPIO37 and GPIO38 are the **console UART pins** (USB-UART bridge, used by `idf.py monitor`).
+**Do NOT assign BARCODE_RX/TX to GPIO37/38** — UART1 init on those pins steals them from the
+console and kills all monitor output. Symptom: monitor dies exactly after startup beep (step 3 init).
+
+**Correct pins (confirmed working):** GPIO4 (RX) and GPIO5 (TX) — as set in config.h.
 
 ---
 
@@ -74,13 +72,142 @@ All other components (esp_eth, esp_http_client, lwip, etc.) are built-in ESP-IDF
 
 ---
 
-## API Endpoint
+## API Backend Selection
+
+Toggle with one line in `config.h`:
+
+```c
+#define USE_PA_API  0   // 0 = Anadolu University API
+                        // 1 = PythonAnywhere API
 ```
-POST https://anages.anadolu.edu.tr/api/dis-erisim/kart-erisim-arge
-Body:     {"mifareId":"<UID_OR_BARCODE>"}
+
+| API | File | Endpoint |
+|-----|------|----------|
+| Anadolu University | `access_check.c` | `https://anages.anadolu.edu.tr/api/dis-erisim/kart-erisim-arge` |
+| PythonAnywhere | `pa_access_check.c` | `https://mbaykal.pythonanywhere.com/api/card-access` |
+
+Both use a **persistent TLS connection** (init/keepalive/deinit pattern) — only the first request pays the TLS handshake cost.
+
+### Anadolu University API
+```
+Request:  POST {"mifareId":"<UID_OR_BARCODE>"}
 Response: {"Sonuc":true/false, "Ad":"Name", "Soyad":"Surname"}
+Auth:     Bearer JWT (API_BEARER_TOKEN in secrets.h — valid until 2050)
 ```
-Bearer JWT in `config.h` — valid until 2050.
+
+### PythonAnywhere Card-Access API
+```
+Request:  POST {"mifareId":"<UID_OR_BARCODE>", "terminalId":"203"}
+Response: {"Sonuc":true/false, "Mesaj":"...", "name":"Full Name"}
+Auth:     Bearer token (PA_ACCESS_TOKEN in secrets.h)
+```
+
+---
+
+## How to Switch API Endpoint (URL / terminalId / request body / response parser)
+
+When testing a new endpoint or reverting to an old one, there are **4 places** to update — all in `main/access_check.c` and `main/config.h`. Do them in order.
+
+### Step 1 — URL  (`main/config.h` lines 113–117)
+
+Comment out the current `#define API_URL` and add the new one:
+```c
+// OLD (dis-erisim):
+// #define API_URL  "https://anages.anadolu.edu.tr/api/dis-erisim/kart-erisim-arge"
+
+// CURRENT (online-erisim):
+#define API_URL \
+    "https://anages.anadolu.edu.tr/api/terminal/online-erisim"
+```
+
+### Step 2 — Terminal ID  (`main/config.h` lines 122–124)
+
+Comment out the current value and add the new one:
+```c
+// #define API_TERMINAL_ID     "203"          // dis-erisim terminal
+#define API_TERMINAL_ID     "75379662"        // online-erisim terminal
+```
+
+> **terminalId format in JSON body matters:**
+> - `online-erisim` → must be a **JSON number**: `"terminalId":75379662`  (no quotes)
+> - `dis-erisim`    → must be a **JSON string**: `"terminalId":"203"`     (with quotes)
+>
+> The format is controlled in the body snprintf — see Step 3.
+
+### Step 3 — Request body  (`main/access_check.c` lines 246–250 and 196–200)
+
+Two places: the **access check body** and the **keepalive body** (they must stay in sync).
+
+**Access check body** (line 248–250):
+```c
+// online-erisim: terminalId as JSON number, includes zaman
+snprintf(body, sizeof(body),
+         "{\"terminalId\":%s,\"mifareId\":\"%s\",\"zaman\":\"%s\"}",
+         API_TERMINAL_ID, uid_str, zaman);
+
+// dis-erisim: terminalId as quoted string, mifareId first
+// snprintf(body, sizeof(body),
+//          "{\"mifareId\":\"%s\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
+//          uid_str, API_TERMINAL_ID, zaman);
+```
+
+**Keepalive body** (line 198–200) — same pattern, empty mifareId:
+```c
+// online-erisim:
+snprintf(body, sizeof(body),
+         "{\"terminalId\":%s,\"mifareId\":\"\",\"zaman\":\"%s\"}",
+         API_TERMINAL_ID, zaman);
+
+// dis-erisim:
+// snprintf(body, sizeof(body),
+//          "{\"mifareId\":\"\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
+//          API_TERMINAL_ID, zaman);
+```
+
+### Step 4 — Response parser  (`main/access_check.c` lines 286–312)
+
+Each endpoint returns different JSON field names for the grant decision and name:
+
+| Endpoint | Grant field | Value when granted | Name field |
+|----------|------------|-------------------|------------|
+| `online-erisim` | `erisimSonucApiViewModel` | `"ERISIM_KABUL_EDILDI"` (string) | `isim` |
+| `dis-erisim` | `Sonuc` | `true` (bool) | `Ad` + `Soyad` (separate) |
+
+Switch the active `cJSON_GetObjectItem` call and the field names for `isim`/`mesaj` accordingly.
+The old parsers are preserved in comments directly above the active code.
+
+> **Also update `access_check.h`** (lines 10–16 and struct definition lines 24–37)
+> if the result struct fields change (e.g. reverting to `first_name`/`last_name`).
+
+### Quick-reference: current state
+
+| Item | Current value | File:line |
+|------|--------------|-----------|
+| API_URL | `terminal/online-erisim` | `config.h:116` |
+| API_TERMINAL_ID | `75379662` | `config.h:124` |
+| Request body | `terminalId` as number + `zaman` | `access_check.c:248` |
+| Keepalive body | same format, empty mifareId | `access_check.c:198` |
+| Grant field | `erisimSonucApiViewModel` | `access_check.c:300` |
+| Name field | `isim` | `access_check.c:307` |
+
+---
+
+## PythonAnywhere Status Reporter
+
+Every 30 s (piggybacked on heartbeat), the device POSTs status to the dashboard:
+```
+POST https://mbaykal.pythonanywhere.com/api/turnstile_status
+Body: {
+    "device_name":               "Eczacılık Fakültesi 1",
+    "nfc_online":                true/false,
+    "qr_online":                 true/false,
+    "uptime_seconds":            <float>,
+    "last_nfc_read_seconds_ago": <float or null>,   // null = no card read yet
+    "last_qr_read_seconds_ago":  <float or null>
+}
+```
+`last_nfc_read_seconds_ago` is based on **actual card reads only** (`s_nfc_last_card_read`),
+not NFC watchdog resets (`s_nfc_last_activity`). These are separate variables.
 
 ---
 
@@ -89,7 +216,7 @@ Bearer JWT in `config.h` — valid until 2050.
 |-------|------|
 | Boot startup | GRANT sequence (confirms speaker works) |
 | Access GRANTED | 1000 Hz (200 ms) → silence (100 ms) → 1500 Hz (200 ms) |
-| Access DENIED | 400 Hz (400 ms) |
+| Access DENIED | 700 Hz (400 ms) |
 
 ---
 
@@ -99,16 +226,46 @@ telnet <device-ip> 23
 ```
 Shows real-time access events, status heartbeat every 30 s, up to 3 clients.
 
+Sample output:
+```
+[CHECK] NFC: A3F2C1B0
+[GRANT] User: Ali Veli  UID: A3F2C1B0  react: 187 ms
+──────────────────────────────────────────
+STATUS  Uptime: 00h 12m 05s
+        Reaction (door open) — avg: 191 ms  min: 174 ms  max: 223 ms  n=12
+──────────────────────────────────────────
+```
+
+---
+
+## Reaction Time Measurement
+
+`handle_access()` records `t_detect = now_ms()` the moment a card UID is identified.
+`react_ms = now_ms() - t_detect` is computed right before the LED fires.
+
+- Logged on every `[GRANT]` and `[DENY]` line in telnet
+- Grant stats tracked: count, min, max, rolling average
+- Displayed in the 30 s heartbeat: `Reaction (door open) — avg: X ms  min: X ms  max: X ms  n=X`
+
 ---
 
 ## Timing Constants (all in config.h)
 | Constant | Value | Purpose |
 |---------|-------|---------|
 | CARD_READ_DELAY_MS | 2000 | Duplicate detection window |
-| NFC_HEALTH_CHECK_MS | 10000 | PN532 firmware ping interval |
+| NFC_HEALTH_CHECK_MS | 30000 | PN532 firmware ping interval |
 | NFC_RETRY_DELAY_MS | 5000 | Wait between recovery attempts |
 | STATUS_HEARTBEAT_MS | 30000 | Serial/telnet heartbeat |
 | LED_ON_TIME_MS | 1000 | Auto-off after grant/deny |
+| API_TIMEOUT_MS | 5000 | HTTP request timeout (was 10000) |
+
+---
+
+## Secrets (main/secrets.h — never commit)
+| Constant | Purpose |
+|----------|---------|
+| `API_BEARER_TOKEN` | JWT for Anadolu University API — valid until 2050 |
+| `PA_ACCESS_TOKEN` | Bearer token for PythonAnywhere card-access API |
 
 ---
 
@@ -119,9 +276,10 @@ Shows real-time access events, status heartbeat every 30 s, up to 3 clients.
 | No audio | DOUT/DIN swapped | Check I2S_DOUT_PIN=GPIO9 in config.h |
 | Audio too quiet | ES8311 volume | esp_codec_dev_set_out_vol(dev, 100) |
 | PN532 "not responding" | DIP switches wrong | Set SW1=ON SW2=OFF (SPI mode) |
-| PN532 "not responding" | SPI bit order | Must use SPI_DEVICE_BIT_LSBFIRST |
+| PN532 "not responding" | SPI bit order | Uses software `rev_byte()` — do NOT add SPI_DEVICE_BIT_LSBFIRST |
 | No Ethernet | RMII clock | IP101 PHY must be powered; check RST=GPIO51 |
 | Telnet disconnects | Socket pruning | Normal — client sent FIN/RST |
+| `last_nfc_read` wrong | Using wrong timestamp | Use `s_nfc_last_card_read`, not `s_nfc_last_activity` |
 
 ---
 

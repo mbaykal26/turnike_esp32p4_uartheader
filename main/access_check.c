@@ -1,7 +1,10 @@
 /*
- * access_check.c – HTTPS POST to university access control API
+ * access_check.c – HTTPS POST to Anadolu University access control API
  *
- * Persistent connection design:
+ * Switched endpoint:  dis-erisim/kart-erisim-arge  →  terminal/online-erisim
+ * Old request/response format is preserved in comments below each changed block.
+ *
+ * Persistent connection design (unchanged):
  *   access_check_init()      — called once when Ethernet is up.
  *                              Creates the esp_http_client handle, sets fixed
  *                              headers (Content-Type, Authorization), and
@@ -17,14 +20,11 @@
  *
  *   access_check_deinit()    — release resources when Ethernet goes down.
  *
- * Without persistent connection every card read costs:
- *   TCP handshake  ~50–200 ms
- *   TLS handshake  ~500–2000 ms   ← dominant cost
- *   HTTP round-trip ~100–300 ms
- *   Total          ~650–2500 ms
- *
- * With persistent connection every card read costs only the HTTP round-trip:
- *   ~100–300 ms
+ * NEW API (terminal/online-erisim):
+ *   Request:  POST {"terminalId":203,"mifareId":"<uid>","zaman":"2025-01-01T12:00:00"}
+ *   Response: {"sonuc":"ERISIM_KABUL_EDILDI"|false,"isim":"Ad Soyad","mesaj":"..."}
+ *   terminalId is a JSON number (not a quoted string).
+ *   "sonuc" may be the string "ERISIM_KABUL_EDILDI" (granted) or boolean false.
  */
 
 #include "access_check.h"
@@ -188,9 +188,15 @@ void access_check_keepalive(void)
     char zaman[20];
     strftime(zaman, sizeof(zaman), "%Y-%m-%dT%H:%M:%S", &t);
 
+    /* OLD keepalive body (dis-erisim):
+     * snprintf(body, sizeof(body),
+     *          "{\"mifareId\":\"\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
+     *          API_TERMINAL_ID, zaman);
+     */
+    /* NEW keepalive body (online-erisim): terminalId as JSON number */
     char body[128];
     snprintf(body, sizeof(body),
-             "{\"mifareId\":\"\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
+             "{\"terminalId\":%s,\"mifareId\":\"\",\"zaman\":\"%s\"}",
              API_TERMINAL_ID, zaman);
 
     // ONE attempt only — no retry.  do_post() retries which could block the
@@ -220,9 +226,9 @@ esp_err_t access_check(const char *uid_str, access_result_t *result)
         return ESP_ERR_INVALID_STATE;
     }
 
-    result->granted       = false;
-    result->first_name[0] = '\0';
-    result->last_name[0]  = '\0';
+    result->granted  = false;
+    result->name[0]  = '\0';
+    result->mesaj[0] = '\0';
 
     // Build JSON body.
     time_t now = time(NULL);
@@ -231,10 +237,17 @@ esp_err_t access_check(const char *uid_str, access_result_t *result)
     char zaman[20];
     strftime(zaman, sizeof(zaman), "%Y-%m-%dT%H:%M:%S", &t);
 
+    /* OLD body (dis-erisim): terminalId as quoted string, mifareId first
+     * char body[256];
+     * snprintf(body, sizeof(body),
+     *          "{\"mifareId\":\"%s\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
+     *          uid_str, API_TERMINAL_ID, zaman);
+     */
+    /* NEW body (online-erisim): terminalId as JSON number (no quotes), field order matches api_spi.py */
     char body[256];
     snprintf(body, sizeof(body),
-             "{\"mifareId\":\"%s\",\"terminalId\":\"%s\",\"zaman\":\"%s\"}",
-             uid_str, API_TERMINAL_ID, zaman);
+             "{\"terminalId\":%s,\"mifareId\":\"%s\",\"zaman\":\"%s\"}",
+             API_TERMINAL_ID, uid_str, zaman);
 
     ESP_LOGI(TAG, "POST %s  mifareId=%s", API_URL, uid_str);
 
@@ -245,7 +258,7 @@ esp_err_t access_check(const char *uid_str, access_result_t *result)
     }
 
     ESP_LOGI(TAG, "HTTP status: %d  body_len: %zu", http_status, s_resp.len);
-    ESP_LOGD(TAG, "Response: %s", s_resp.buf);
+    ESP_LOGI(TAG, "Response: %s", s_resp.buf);
 
     if (http_status != 200 || s_resp.len == 0) {
         ESP_LOGW(TAG, "Unexpected HTTP status %d", http_status);
@@ -259,23 +272,50 @@ esp_err_t access_check(const char *uid_str, access_result_t *result)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    cJSON *sonuc = cJSON_GetObjectItem(root, "Sonuc");
-    if (cJSON_IsBool(sonuc)) {
+    /* OLD parser (dis-erisim — Sonuc bool, Ad, Soyad):
+     * cJSON *sonuc = cJSON_GetObjectItem(root, "Sonuc");
+     * if (cJSON_IsBool(sonuc)) { result->granted = cJSON_IsTrue(sonuc); }
+     * cJSON *ad    = cJSON_GetObjectItem(root, "Ad");
+     * cJSON *soyad = cJSON_GetObjectItem(root, "Soyad");
+     * if (cJSON_IsString(ad)    && ad->valuestring)
+     *     strlcpy(result->first_name, ad->valuestring, ACCESS_NAME_MAX);
+     * if (cJSON_IsString(soyad) && soyad->valuestring)
+     *     strlcpy(result->last_name,  soyad->valuestring, ACCESS_NAME_MAX);
+     */
+
+    /* NEW parser (online-erisim — erisimSonucApiViewModel string, isim, mesaj):
+     * "erisimSonucApiViewModel" == "ERISIM_KABUL_EDILDI"  → granted
+     * "isim"  = full name
+     * "mesaj" = status/reason message
+     *
+     * NOTE: will revert to dis-erisim (terminalId 203, Sonuc bool) later.
+     * OLD parser (sonuc field — wrong field name for this endpoint):
+     * cJSON *sonuc = cJSON_GetObjectItem(root, "sonuc");
+     * if (cJSON_IsString(sonuc) && sonuc->valuestring) {
+     *     result->granted = (strcmp(sonuc->valuestring, "ERISIM_KABUL_EDILDI") == 0);
+     * } else if (cJSON_IsBool(sonuc)) {
+     *     result->granted = cJSON_IsTrue(sonuc);
+     * }
+     */
+    cJSON *sonuc = cJSON_GetObjectItem(root, "erisimSonucApiViewModel");
+    if (cJSON_IsString(sonuc) && sonuc->valuestring) {
+        result->granted = (strcmp(sonuc->valuestring, "ERISIM_KABUL_EDILDI") == 0);
+    } else if (cJSON_IsBool(sonuc)) {
         result->granted = cJSON_IsTrue(sonuc);
     }
 
-    cJSON *ad    = cJSON_GetObjectItem(root, "Ad");
-    cJSON *soyad = cJSON_GetObjectItem(root, "Soyad");
-    if (cJSON_IsString(ad) && ad->valuestring)
-        strlcpy(result->first_name, ad->valuestring, ACCESS_NAME_MAX);
-    if (cJSON_IsString(soyad) && soyad->valuestring)
-        strlcpy(result->last_name, soyad->valuestring, ACCESS_NAME_MAX);
+    cJSON *isim  = cJSON_GetObjectItem(root, "isim");
+    cJSON *mesaj = cJSON_GetObjectItem(root, "mesaj");
+    if (cJSON_IsString(isim)  && isim->valuestring)
+        strlcpy(result->name,  isim->valuestring,  ACCESS_NAME_MAX);
+    if (cJSON_IsString(mesaj) && mesaj->valuestring)
+        strlcpy(result->mesaj, mesaj->valuestring, ACCESS_MESAJ_MAX);
 
     cJSON_Delete(root);
 
-    ESP_LOGI(TAG, "Decision: %s  User: %s %s",
+    ESP_LOGI(TAG, "Decision: %s  Name: %s  Mesaj: %s",
              result->granted ? "GRANTED" : "DENIED",
-             result->first_name, result->last_name);
+             result->name, result->mesaj);
 
     return ESP_OK;
 }

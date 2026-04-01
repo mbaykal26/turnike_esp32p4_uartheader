@@ -41,7 +41,12 @@
 #include "gm805_uart.h"
 #include "eth_ip101.h"
 #include "telnet_server.h"
-#include "access_check.h"
+#if USE_PA_API
+#  include "pa_access_check.h"
+#else
+#  include "access_check.h"
+#endif
+#include "status_reporter.h"
 
 static const char *TAG = "main";
 
@@ -159,8 +164,18 @@ static uint32_t s_total_denied  = 0;
 static uint32_t s_total_nfc     = 0;
 static uint32_t s_total_barcode = 0;
 
+// Reaction time: card detected → green LED (door open), grants only.
+static uint32_t s_react_count    = 0;
+static uint64_t s_react_total_ms = 0;   // uint64 to survive many readings
+static uint32_t s_react_min_ms   = UINT32_MAX;
+static uint32_t s_react_max_ms   = 0;
+
 static void handle_access(const char *uid_str, bool is_barcode)
 {
+    // t_detect: moment the card/barcode was identified by the reader.
+    // Everything from here to led_on() is the user-perceived reaction time.
+    const uint32_t t_detect = now_ms();
+
     if (!eth_is_connected()) {
         telnet_logf("[SKIP] No Ethernet — cannot check %s", uid_str);
         return;
@@ -172,27 +187,52 @@ static void handle_access(const char *uid_str, bool is_barcode)
     telnet_logf("[CHECK] %s: %s",
                 is_barcode ? "Barcode" : "NFC", uid_str);
 
+#if USE_PA_API
+    pa_access_result_t result;
+    esp_err_t err = pa_access_check(uid_str, &result);
+#else
     access_result_t result;
     esp_err_t err = access_check(uid_str, &result);
+#endif
 
     if (err != ESP_OK) {
-        telnet_logf("[ERROR] API request failed: %s", esp_err_to_name(err));
+        uint32_t react_ms = now_ms() - t_detect;
+        telnet_logf("[ERROR] API request failed: %s  (%lu ms)", esp_err_to_name(err), react_ms);
         led_on(&s_led_red);
         audio_play_deny();
         s_total_denied++;
         return;
     }
 
+    uint32_t react_ms = now_ms() - t_detect;
+
     if (result.granted) {
         s_total_granted++;
-        telnet_logf("[GRANT] User: %s %s  UID: %s",
-                    result.first_name, result.last_name, uid_str);
+        // Update grant reaction-time stats
+        s_react_count++;
+        s_react_total_ms += react_ms;
+        if (react_ms < s_react_min_ms) s_react_min_ms = react_ms;
+        if (react_ms > s_react_max_ms) s_react_max_ms = react_ms;
+#if USE_PA_API
+        telnet_logf("[GRANT] %s  UID: %s  react: %lu ms", result.mesaj, uid_str, react_ms);
+#else
+        /* OLD: telnet_logf("[GRANT] User: %s %s  UID: %s  react: %lu ms",
+         *                  result.first_name, result.last_name, uid_str, react_ms); */
+        telnet_logf("[GRANT] %s  UID: %s  react: %lu ms",
+                    result.name, uid_str, react_ms);
+#endif
         led_on(&s_led_green);
         audio_play_grant();
     } else {
         s_total_denied++;
-        telnet_logf("[DENY]  UID: %s  (%s %s)",
-                    uid_str, result.first_name, result.last_name);
+#if USE_PA_API
+        telnet_logf("[DENY]  UID: %s  Mesaj: %s  react: %lu ms", uid_str, result.mesaj, react_ms);
+#else
+        /* OLD: telnet_logf("[DENY]  UID: %s  (%s %s)  react: %lu ms",
+         *                  uid_str, result.first_name, result.last_name, react_ms); */
+        telnet_logf("[DENY]  UID: %s  Name: %s  Mesaj: %s  react: %lu ms",
+                    uid_str, result.name, result.mesaj, react_ms);
+#endif
         led_on(&s_led_red);
         audio_play_deny();
     }
@@ -202,11 +242,12 @@ static void handle_access(const char *uid_str, bool is_barcode)
 // NFC health check & recovery
 // ─────────────────────────────────────────────────────────────────
 
-static bool    s_nfc_ready         = false;
-static int     s_nfc_fail_count    = 0;
-static uint32_t s_nfc_last_health  = 0;
-static uint32_t s_nfc_last_fail_t  = 0;
-static uint32_t s_nfc_last_activity= 0;
+static bool    s_nfc_ready          = false;
+static int     s_nfc_fail_count     = 0;
+static uint32_t s_nfc_last_health   = 0;
+static uint32_t s_nfc_last_fail_t   = 0;
+static uint32_t s_nfc_last_activity = 0;  // any PN532 detection (card or poll) — watchdog use only
+static uint32_t s_nfc_last_card_read = 0; // real card read only — for status reporting
 
 static void nfc_health_check(void)
 {
@@ -280,9 +321,28 @@ static void print_heartbeat(void)
                 s_total_nfc, s_total_barcode);
     telnet_logf("        Access — Granted: %lu  Denied: %lu",
                 s_total_granted, s_total_denied);
+    if (s_react_count > 0) {
+        uint32_t avg_ms = (uint32_t)(s_react_total_ms / s_react_count);
+        telnet_logf("        Reaction (door open) — avg: %lu ms  min: %lu ms  max: %lu ms  n=%lu",
+                    avg_ms, s_react_min_ms, s_react_max_ms, s_react_count);
+    }
     telnet_logf("──────────────────────────────────────────");
 
     s_last_heartbeat = now_ms();
+
+    /* ── Status report to PythonAnywhere dashboard ── */
+    if (eth_is_connected()) {
+        float last_nfc_secs = (s_nfc_last_card_read > 0)
+            ? (float)((now_ms() - s_nfc_last_card_read) / 1000)
+            : -1.0f;
+        float last_qr_secs = (s_last_barcode_time > 0)
+            ? (float)((now_ms() - s_last_barcode_time) / 1000)
+            : -1.0f;
+        status_reporter_send(s_nfc_ready, true,
+                             (float)uptime_s,
+                             last_nfc_secs,
+                             last_qr_secs);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -391,7 +451,11 @@ void app_main(void)
             s_telnet_started = true;
 
         // Pre-warm HTTPS connection while Ethernet is already up at boot.
+#if USE_PA_API
+        if (pa_access_check_init() == ESP_OK)
+#else
         if (access_check_init() == ESP_OK)
+#endif
             s_http_initialized = true;
     } else {
         ESP_LOGW(TAG, "  Skipped (no Ethernet) — will start when connected");
@@ -420,7 +484,11 @@ void app_main(void)
             // Send HTTP keepalive to prevent server from timing out the idle
             // persistent connection.  Runs on the same 30 s heartbeat cadence.
             if (s_http_initialized) {
+#if USE_PA_API
+                pa_access_check_keepalive();
+#else
                 access_check_keepalive();
+#endif
             }
         }
 
@@ -435,7 +503,11 @@ void app_main(void)
             // If Ethernet just went down, tear down the persistent HTTP client
             // so it is recreated cleanly when the link comes back.
             if (s_http_initialized) {
+#if USE_PA_API
+                pa_access_check_deinit();
+#else
                 access_check_deinit();
+#endif
                 s_http_initialized = false;
                 ESP_LOGW(TAG, "Ethernet lost — HTTPS persistent connection closed");
             }
@@ -446,7 +518,11 @@ void app_main(void)
         // ── Init persistent HTTPS connection if not done yet ──
         // Handles the case where Ethernet was not available at boot.
         if (!s_http_initialized) {
+#if USE_PA_API
+            if (pa_access_check_init() == ESP_OK) {
+#else
             if (access_check_init() == ESP_OK) {
+#endif
                 s_http_initialized = true;
             }
         }
@@ -477,7 +553,8 @@ void app_main(void)
         if (s_nfc_ready) {
             pn532_card_t card;
             if (pn532_read_passive_target(&card)) {
-                s_nfc_last_activity = now_ms();
+                s_nfc_last_activity  = now_ms();
+                s_nfc_last_card_read = now_ms();   // actual card detected
 
                 if (!is_card_duplicate(&card)) {
                     char uid_str[PN532_UID_MAX_LEN * 2 + 1];

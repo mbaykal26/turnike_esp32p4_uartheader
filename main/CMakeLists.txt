@@ -8,6 +8,8 @@ idf_component_register(
         "telnet_server.c"
         "access_check.c"
         "ota.c"
+        "status_reporter.c"
+        "pa_access_check.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_driver_i2s

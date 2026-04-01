@@ -17,40 +17,67 @@ ESP32_P4_access_idf/
 └── main/
     ├── CMakeLists.txt      component registration + PRIV_REQUIRES list
     ├── idf_component.yml   managed component: espressif/esp_codec_dev ≥1.3.4
-    ├── config.h            ★ ALL pins / API URL / JWT / timing constants
+    ├── config.h            ★ ALL pins / URLs / timing / API backend switch
+    ├── secrets.h           ★ Bearer tokens — NEVER commit (in .gitignore)
+    ├── secrets.h.template  safe placeholder for repo
     ├── app_main.c          entry point, init sequence, main access-control loop
     ├── audio.c / .h        ES8311 codec + NS4150B amp via esp_codec_dev
     ├── pn532_spi.c / .h    PN532 NFC hardware SPI driver (no Arduino libs)
     ├── gm805_uart.c / .h   GM805 barcode scanner UART driver
     ├── eth_ip101.c / .h    IP101 PHY + ESP32-P4 EMAC + DHCP
     ├── telnet_server.c / .h TCP port-23 log server (up to 3 clients)
-    └── access_check.c / .h HTTPS POST to university API + JSON parse
+    ├── access_check.c / .h Anadolu University HTTPS API (persistent TLS)
+    ├── pa_access_check.c/h PythonAnywhere card-access API (persistent TLS)
+    └── status_reporter.c/h PythonAnywhere status dashboard (one-shot POST)
 ```
+
+---
+
+## API Backend Selection
+
+Controlled by a single constant in `config.h`:
+
+```c
+#define USE_PA_API  0   // 0 = Anadolu University, 1 = PythonAnywhere
+```
+
+All four call sites in `app_main.c` (init, deinit, keepalive, check) are wrapped
+in `#if USE_PA_API` / `#else` / `#endif` — changing one line in config.h rebuilds
+for the other backend with no other edits.
 
 ---
 
 ## Module Responsibilities
 
 ### `config.h`
-Central configuration header — **the only file you need to edit** for pin/credential changes.
+Central configuration header — **the only file you need to edit** for pin/URL/timing changes.
 Every other module `#include`s this and reads `#define` constants. Nothing is hardcoded elsewhere.
+Key additions: `USE_PA_API`, `PA_ACCESS_URL`, `DEVICE_NAME`, `REPORTER_URL`, `API_TERMINAL_ID`.
+
+### `secrets.h`
+Confidential tokens — never committed to version control (excluded in `.gitignore`).
+Contains `API_BEARER_TOKEN` (Anadolu University JWT) and `PA_ACCESS_TOKEN` (PythonAnywhere).
 
 ### `audio.c`
 Wraps the confirmed-working speaker_test.c v4 approach:
 1. `audio_init()` — opens I2C bus → starts I2S (MCLK first) → initialises ES8311 via `esp_codec_dev`
 2. `audio_play_grant()` — 1000 Hz + 1500 Hz ascending with 5 ms fade-in/out
-3. `audio_play_deny()` — 400 Hz with fade
+3. `audio_play_deny()` — 700 Hz with fade
 Writes directly to `i2s_tx` channel handle using `i2s_channel_write()`.
 
 ### `pn532_spi.c`
 Pure-C PN532 protocol implementation over ESP-IDF `spi_master`:
-- Uses `SPI2_HOST`, `SPI_DEVICE_BIT_LSBFIRST` (PN532 requires LSB-first per byte)
+- Uses `SPI2_HOST`; software byte reversal (`rev_byte()`) instead of `SPI_DEVICE_BIT_LSBFIRST`
 - Each operation is **one CS-low burst** (send SPI_DIR byte + frame/dummy bytes)
   - Status poll: `[0x02, dummy]` → `rx[1]` = 0x01 when ready
   - Write: `[0x01, preamble, start, len, lcs, tfi, cmd, ..., dcs, post]`
   - ACK read: `[0x03, dummy×6]` → `rx[1..6]` = ACK pattern
   - Response read: `[0x03, dummy×35]` → `rx[1]`=PREAM, `rx[4]`=LEN, `rx[8+]`=DATA
-- Public API: `pn532_init()`, `pn532_get_firmware_version()`, `pn532_read_passive_target()`
+- `wait_ready()` always returns `ESP_OK` (falls through on timeout — clone never sets RDY bit)
+- Public API: `pn532_init()`, `pn532_get_firmware_version()`, `pn532_reconfigure()`,
+  `pn532_read_passive_target(card)` ← no timeout_ms param (removed as dead code)
+- Cold-boot fix: GetFirmwareVersion retries send 10×0x55 wake preamble between attempts
+  to reset PN532 SPI state machine after a failed command
 
 ### `gm805_uart.c`
 Thin UART1 wrapper:
@@ -73,13 +100,32 @@ FreeRTOS task (`telnet_server_task`, priority 3, 4 KB stack):
 - `telnet_log(line)` / `telnet_logf(fmt, ...)`: mutex-protected send to all active clients
   + `ESP_LOGI` to serial simultaneously
 
-### `access_check.c`
-Single function `access_check(uid_str, result)`:
-1. Builds JSON body `{"mifareId":"<uid>"}`
-2. Creates `esp_http_client` for HTTPS POST with Bearer header, TLS cert-verify skipped
-3. Collects response body via `HTTP_EVENT_ON_DATA` callback into stack buffer (1 KB)
-4. Parses JSON with `cJSON_Parse` — extracts `Sonuc` (bool), `Ad`, `Soyad` (strings)
-5. Returns `ESP_OK` on any successful HTTP exchange; caller checks `result.granted`
+### `access_check.c` — Anadolu University API (USE_PA_API = 0)
+**Persistent TLS connection** — one handshake at boot, reused for every card read:
+- `access_check_init()` — creates `esp_http_client`, pre-warms TLS with a keepalive POST
+- `access_check_keepalive()` — called every 30 s to prevent server closing idle connection
+- `access_check_deinit()` — releases resources when Ethernet drops
+- `access_check(uid, result)` — POST `{"mifareId":"<uid>"}`, retry once on TCP error;
+  parses `Sonuc` (bool), `Ad`, `Soyad` from JSON response
+- Response buffer: 1 KB (stack-allocated in `http_resp_t` struct passed as `user_data`)
+
+### `pa_access_check.c` — PythonAnywhere API (USE_PA_API = 1)
+Same persistent-TLS design as `access_check.c`:
+- `pa_access_check_init()` — creates client, pre-warms TLS
+- `pa_access_check_keepalive()` — 30 s keepalive
+- `pa_access_check_deinit()` — teardown on Ethernet loss
+- `pa_access_check(uid, result)` — POST `{"mifareId":"<uid>","terminalId":"203"}`;
+  parses `Sonuc` (bool), `Mesaj`, `name` from JSON response
+- Response buffer: 1 KB (no photo support — simplified from sample code)
+- Auth: `Authorization: Bearer PA_ACCESS_TOKEN` from secrets.h
+
+### `status_reporter.c` — PythonAnywhere dashboard
+One-shot HTTPS POST, called every 30 s from `print_heartbeat()`:
+- No persistent connection (low-frequency, non-critical path)
+- Sends: `device_name`, `nfc_online`, `qr_online`, `uptime_seconds`,
+  `last_nfc_read_seconds_ago` (null if no card ever read), `last_qr_read_seconds_ago`
+- Uses `s_nfc_last_card_read` (actual card reads only) — **not** `s_nfc_last_activity`
+  (which is also reset by the NFC watchdog and would give misleading timestamps)
 
 ### `app_main.c`
 Init sequence and main loop:
@@ -91,7 +137,7 @@ Init sequence and main loop:
 [3/6] gm805_init()
 [4/6] pn532_init()          → logs FW version if found
 [5/6] eth_init()            → blocks ≤30 s for DHCP
-[6/6] telnet_start()        → creates server task
+[6/6] telnet_start() + access_check_init() (or pa_access_check_init())
 ```
 
 **Main loop (while(1) in app_main task):**
@@ -99,12 +145,15 @@ Init sequence and main loop:
 ┌─────────────────────────────────────────────────────────┐
 │ led_update()          auto-off after LED_ON_TIME_MS      │
 │ heartbeat check       every STATUS_HEARTBEAT_MS          │
+│   → print_heartbeat() → status_reporter_send()          │
+│   → access_check_keepalive() / pa_access_check_keepalive│
 │ start telnet lazily   if ETH just came up                │
-│ if !eth → sleep 100 ms, continue                         │
+│ if !eth → teardown HTTP client, sleep 100 ms, continue   │
+│ if !http_init → access_check_init() / pa_access_check…  │
 │ if !nfc_ready → nfc_try_recover()                        │
 │ if nfc_ready  → health check every NFC_HEALTH_CHECK_MS   │
 │ NFC watchdog  → re-check if silent for 30 s              │
-│ pn532_read_passive_target(card, 50 ms)                   │
+│ pn532_read_passive_target(&card)   [no timeout_ms param] │
 │   if card found + not duplicate → handle_access(uid)     │
 │ gm805_read_barcode(buf, 50 ms)                           │
 │   if barcode found + not duplicate → handle_access(uid)  │
@@ -114,11 +163,27 @@ Init sequence and main loop:
 
 **`handle_access(uid_str, is_barcode)`:**
 ```
-access_check(uid) → ESP_OK ?
-    granted  → LED green ON + audio_play_grant() + telnet [GRANT]
-    denied   → LED red ON  + audio_play_deny()  + telnet [DENY]
-    API fail → LED red ON  + audio_play_deny()  + telnet [ERROR]
+t_detect = now_ms()                   ← reaction timer starts here
+#if USE_PA_API
+  pa_access_check(uid) → result
+#else
+  access_check(uid)    → result
+#endif
+react_ms = now_ms() - t_detect        ← time from detection to LED
+    granted  → update stats + LED green ON + audio_play_grant() + [GRANT react: X ms]
+    denied   → LED red ON  + audio_play_deny()  + [DENY  react: X ms]
+    API fail → LED red ON  + audio_play_deny()  + [ERROR react: X ms]
 ```
+
+**Reaction-time statistics (grants only):**
+- `s_react_count`, `s_react_total_ms` (uint64), `s_react_min_ms`, `s_react_max_ms`
+- Displayed in 30 s heartbeat: `Reaction (door open) — avg: X ms  min: X ms  max: X ms  n=X`
+
+**NFC timestamp variables:**
+- `s_nfc_last_activity` — updated on any PN532 card detection AND by the watchdog reset;
+  used only by the watchdog to prevent repeated firing
+- `s_nfc_last_card_read` — updated **only** when a real card is detected;
+  used by `status_reporter` for `last_nfc_read_seconds_ago`
 
 ---
 
@@ -130,15 +195,19 @@ Physical layer          Driver layer          Application layer
 
 NFC card ──────────→ pn532_spi.c ──────────→ app_main.c
                       (SPI2, 1MHz)              │
-Barcode ───────────→ gm805_uart.c ────────────→ │──→ access_check.c ──→ API
-                      (UART1)                    │       (HTTPS/TLS)     │
-                                                 │                       │
-                                                 ↓                       ↓
-                                           telnet_server.c       result.granted
-                                            (TCP port 23)              │
-                                                                        ↓
-                                                               audio.c (ES8311)
-                                                               LED GPIO
+Barcode ───────────→ gm805_uart.c ────────────→ │──→ access_check.c ──→ Anadolu Univ API
+                      (UART1)                    │       (HTTPS/TLS)
+                                                 │──→ pa_access_check.c → PythonAnywhere
+                                                 │       (HTTPS/TLS)        card-access
+                                                 │
+                                                 │──→ status_reporter.c → PythonAnywhere
+                                                 │       (HTTPS/TLS)        dashboard
+                                                 ↓
+                                           telnet_server.c         result.granted
+                                            (TCP port 23)               │
+                                                                         ↓
+                                                                audio.c (ES8311)
+                                                                LED GPIO (door)
 ```
 
 ---
@@ -156,15 +225,18 @@ State kept in `app_main.c` as simple structs (last UID bytes + timestamp, last b
 ## NFC Health & Recovery
 
 ```
-nfc_health_check()     every 10 s  → pn532_get_firmware_version()
+nfc_health_check()     every 30 s  → pn532_get_firmware_version()
                                        OK  → reset fail count
                                        FAIL → nfc_ready=false, increment fail count
 
-nfc_try_recover()      if !nfc_ready → retry after NFC_RETRY_DELAY_MS (5 s)
+nfc_try_recover()      if !nfc_ready → pn532_reconfigure() after NFC_RETRY_DELAY_MS (5 s)
+                                       pn532_reconfigure() sends wake preamble (10×0x55)
+                                       + 1000 ms settle + SAM configure + MaxRetries=5
                                        if fail count > 5 → delay doubles
                                        if fail count ≥ 6 → log "check wiring"
 
 nfc_watchdog           if nfc_ready but no activity for 30 s → force health check
+                       (stamps s_nfc_last_activity only, NOT s_nfc_last_card_read)
 ```
 
 ---
@@ -178,6 +250,8 @@ nfc_watchdog           if nfc_ready but no activity for 30 s → force health ch
 | Audio I2S writes | Called only from main loop task (single writer) |
 | NFC SPI | Called only from main loop task (single writer) |
 | GM805 UART | Called only from main loop task (single reader) |
+| HTTP clients (access_check, pa_access_check) | Called only from main loop task |
+| status_reporter | Called only from main loop task (heartbeat) |
 
 The telnet server task only sends (no receive processing). The main task reads sensors and calls `telnet_logf()` which takes the mutex briefly. No deadlock risk.
 
@@ -196,10 +270,10 @@ Declared in `main/CMakeLists.txt` under `PRIV_REQUIRES`:
 | `esp_driver_gpio` | app_main.c (LEDs) |
 | `esp_eth` | eth_ip101.c |
 | `esp_netif` | eth_ip101.c |
-| `esp_http_client` | access_check.c |
-| `esp_tls` | access_check.c (HTTPS) |
+| `esp_http_client` | access_check.c, pa_access_check.c, status_reporter.c |
+| `esp_tls` | access_check.c, pa_access_check.c, status_reporter.c |
 | `lwip` | telnet_server.c (sockets) |
-| `json` | access_check.c (cJSON) |
+| `json` | access_check.c, pa_access_check.c, status_reporter.c (cJSON) |
 | `nvs_flash` | eth_ip101.c |
 | `esp_timer` | app_main.c, pn532_spi.c (timestamps) |
 | `espressif/esp_codec_dev` | audio.c (managed, via idf_component.yml) |

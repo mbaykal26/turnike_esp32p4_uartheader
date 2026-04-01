@@ -8,8 +8,8 @@
 #include "esp_err.h"
 
 /**
- * Initialise UART1 for GM805 at 115200 baud.
- * RX=GPIO4, TX=GPIO5
+ * Initialise UART1 for GM861 at 115200 baud.
+ * RX=GPIO38, TX=GPIO37  (SH1.0 UART header, #6 on board)
  */
 esp_err_t gm805_init(void);
 

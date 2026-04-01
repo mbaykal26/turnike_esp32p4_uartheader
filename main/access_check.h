@@ -7,19 +7,33 @@
  * Call access_check_keepalive() every ~30 s to prevent the server from timing
  * out the idle connection.  Call access_check_deinit() if Ethernet goes down.
  *
- * API:
- *   POST {"mifareId": "<uid_or_barcode>", "terminalId": "...", "zaman": "..."}
+ * OLD API (dis-erisim — commented out):
+ *   POST {"mifareId":"<uid>","terminalId":"203","zaman":"..."}
  *   Response: { "Sonuc": true/false, "Ad": "FirstName", "Soyad": "LastName" }
+ *
+ * NEW API (online-erisim):
+ *   POST {"terminalId":203,"mifareId":"<uid>","zaman":"..."}
+ *   Response: { "sonuc": "ERISIM_KABUL_EDILDI" | false, "isim": "...", "mesaj": "..." }
  */
 #include <stdbool.h>
 #include "esp_err.h"
 
-#define ACCESS_NAME_MAX  64
+#define ACCESS_NAME_MAX   64
+#define ACCESS_MESAJ_MAX  128
 
+/* OLD struct (dis-erisim response — Sonuc/Ad/Soyad):
 typedef struct {
     bool    granted;
     char    first_name[ACCESS_NAME_MAX];
     char    last_name[ACCESS_NAME_MAX];
+} access_result_t;
+*/
+
+/* NEW struct (online-erisim response — sonuc/isim/mesaj): */
+typedef struct {
+    bool    granted;
+    char    name[ACCESS_NAME_MAX];     // "isim" field from API response
+    char    mesaj[ACCESS_MESAJ_MAX];   // "mesaj" field from API response
 } access_result_t;
 
 /**

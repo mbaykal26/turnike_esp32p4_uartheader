@@ -23,7 +23,12 @@
 #define NFC_SPI_FREQ_HZ (1000 * 1000)        // 1 MHz — standard operating speed
 
 // ─────────────────────────────────────────────────────────────────
-// GM805 Barcode Scanner  (UART1)
+// GM861 Barcode Scanner  (UART1)
+// Wired to the SH1.0 4-PIN UART header (#6 on board silkscreen).
+// GPIO4  = UART1 RX (ESP32 RX ← GM861 TX)
+// GPIO5  = UART1 TX (ESP32 TX → GM861 RX)
+// NOTE: GPIO37/38 are the console UART (USB-UART bridge) — do NOT use
+// those for UART1 or the serial monitor dies after UART1 init.
 // ─────────────────────────────────────────────────────────────────
 #define BARCODE_UART_NUM    UART_NUM_1
 #define BARCODE_RX_PIN      GPIO_NUM_4
@@ -61,7 +66,7 @@
 #define TONE_GRANT_2_HZ     1500    // second grant tone (Hz)
 #define TONE_GRANT_DUR_MS   200     // each tone duration
 #define TONE_GRANT_GAP_MS   100     // silence gap between tones
-#define TONE_DENY_HZ        800     // deny tone (Hz)
+#define TONE_DENY_HZ        700     // deny tone (Hz) before it was 800 Hz.
 #define TONE_DENY_DUR_MS    400
 #define TONE_AMPLITUDE      28000   // 16-bit peak (max 32767)
 #define TONE_FADE_SAMPLES   80      // ~5 ms fade to prevent pops
@@ -82,15 +87,40 @@
 #define TELNET_MAX_CLIENTS  3
 
 // ─────────────────────────────────────────────────────────────────
+// API backend selection
+// Set to 1 to use PythonAnywhere card-access API.
+// Set to 0 to use Anadolu University API (access_check.c).
+// Only one should be active at a time.
+// ─────────────────────────────────────────────────────────────────
+#define USE_PA_API  0
+
+// ─────────────────────────────────────────────────────────────────
+// PythonAnywhere card-access API  (pa_access_check.c)
+// ─────────────────────────────────────────────────────────────────
+#define PA_ACCESS_URL  "https://mbaykal.pythonanywhere.com/api/card-access"
+
+// ─────────────────────────────────────────────────────────────────
+// Status Reporter  (PythonAnywhere dashboard)
+// ─────────────────────────────────────────────────────────────────
+#define DEVICE_NAME     "Eczacılık Fakültesi 1"
+#define REPORTER_URL    "https://mbaykal.pythonanywhere.com/api/turnstile_status"
+
+// ─────────────────────────────────────────────────────────────────
 // Web Service  (Anadolu University Access Control API)
 // ─────────────────────────────────────────────────────────────────
+// OLD endpoint (dis-erisim): response keys Sonuc/Ad/Soyad, terminalId as string
+// #define API_URL  "https://anages.anadolu.edu.tr/api/dis-erisim/kart-erisim-arge"
+
+// NEW endpoint (online-erisim): response keys sonuc/isim/mesaj, terminalId as JSON number
 #define API_URL \
-    "https://anages.anadolu.edu.tr/api/dis-erisim/kart-erisim-arge"
+    "https://anages.anadolu.edu.tr/api/terminal/online-erisim"
 
 /* Bearer token is in secrets.h — keep that file private */
 #include "secrets.h"
 
-#define API_TERMINAL_ID     "203"
+// NOTE: API_TERMINAL_ID is rendered without quotes in JSON body ("terminalId":203 not "203").
+// #define API_TERMINAL_ID     "203"
+#define API_TERMINAL_ID     "75379662"
 #define API_TIMEOUT_MS      5000
 
 // ─────────────────────────────────────────────────────────────────
