@@ -8,7 +8,7 @@
 ## Build & Flash
 
 ```bash
-cd C:\Users\Murat\Desktop\ESP32_P4_access_idf
+cd d:\ESP32_P4_access_idf_uart_header
 
 idf.py set-target esp32p4          # only once per clean checkout
 idf.py build                        # first run downloads esp_codec_dev
@@ -211,12 +211,30 @@ not NFC watchdog resets (`s_nfc_last_activity`). These are separate variables.
 
 ---
 
-## Audio Tones
-| Event | Tone |
-|-------|------|
-| Boot startup | GRANT sequence (confirms speaker works) |
-| Access GRANTED | 1000 Hz (200 ms) → silence (100 ms) → 1500 Hz (200 ms) |
-| Access DENIED | 700 Hz (400 ms) |
+## Audio Tones & Voice Phrases
+
+| Event | Tone | Voice (TTS) |
+|-------|------|-------------|
+| Boot startup | GRANT sequence (confirms speaker works) | — |
+| Access GRANTED | 1000 Hz (200 ms) → silence (100 ms) → 1500 Hz (200 ms) | "Hoşgeldiniz" |
+| Access DENIED | 700 Hz (400 ms) | "Kartınızı kontrol ediniz" |
+
+Tones are **synchronous** (blocking, ~600 ms grant / ~430 ms deny).
+Voice phrases run in a **FreeRTOS background task** (`tts_bg`, priority 2) so the main loop is free immediately after the tone. If a new card is scanned while voice is still playing, `abort_tts()` cuts it within ≤50 ms before the new tone starts.
+
+### TTS Data Generation
+
+```bash
+cd tools
+python gen_tts.py        # regenerate main/tts_data.h
+# requires: pip install edge-tts pydub
+#           winget install ffmpeg
+```
+
+- Engine: Microsoft Neural TTS (`edge-tts`), voice `tr-TR-EmelNeural`
+- Output: 16 kHz, 16-bit mono PCM, normalized to −3 dBFS
+- Stored in `main/tts_data.h` as `static const int16_t` C arrays
+- Re-run whenever phrases change; re-run `idf.py build` afterwards
 
 ---
 
@@ -275,6 +293,9 @@ STATUS  Uptime: 00h 12m 05s
 |---------|-------------|-----|
 | No audio | DOUT/DIN swapped | Check I2S_DOUT_PIN=GPIO9 in config.h |
 | Audio too quiet | ES8311 volume | esp_codec_dev_set_out_vol(dev, 100) |
+| TTS voice missing / silent | tts_data.h not generated | Run `tools/gen_tts.py`, then `idf.py build` |
+| TTS cuts off mid-word | abort_tts() timeout too short | Increase poll count in abort_tts() (default 5×10 ms) |
+| Compile error: play_pcm_mono undeclared | Missing forward declaration | Check forward decl before tts_bg_task in audio.c |
 | PN532 "not responding" | DIP switches wrong | Set SW1=ON SW2=OFF (SPI mode) |
 | PN532 "not responding" | SPI bit order | Uses software `rev_byte()` — do NOT add SPI_DEVICE_BIT_LSBFIRST |
 | No Ethernet | RMII clock | IP101 PHY must be powered; check RST=GPIO51 |
