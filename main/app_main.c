@@ -200,6 +200,7 @@ static void handle_access(const char *uid_str, bool is_barcode)
         telnet_logf("[ERROR] API request failed: %s  (%lu ms)", esp_err_to_name(err), react_ms);
         led_on(&s_led_red);
         audio_play_deny();
+        audio_play_tts_deny();
         s_total_denied++;
         return;
     }
@@ -222,7 +223,8 @@ static void handle_access(const char *uid_str, bool is_barcode)
                     result.name, uid_str, react_ms);
 #endif
         led_on(&s_led_green);
-        audio_play_grant();
+        audio_play_grant();   // separate grant tone + gap to fit TTS in between voice messages and avoid clipping
+        audio_play_tts_grant();
     } else {
         s_total_denied++;
 #if USE_PA_API
@@ -234,7 +236,8 @@ static void handle_access(const char *uid_str, bool is_barcode)
                     uid_str, result.name, result.mesaj, react_ms);
 #endif
         led_on(&s_led_red);
-        audio_play_deny();
+        audio_play_deny(); // separate deny tone + gap to fit TTS in between voice messages and avoid clipping
+        audio_play_tts_deny();
     }
 }
 
