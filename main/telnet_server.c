@@ -13,6 +13,7 @@
 #include "telnet_server.h"
 #include "config.h"
 #include "ota.h"
+#include "secrets.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +43,7 @@ static bool              s_ota_running   = false;  // prevents double-trigger
 // Per-client command line accumulator (reset on connect + disconnect)
 static char s_cmd_buf[TELNET_MAX_CLIENTS][256];
 static int  s_cmd_len[TELNET_MAX_CLIENTS];
+static bool s_authed[TELNET_MAX_CLIENTS];  // false = awaiting password
 
 // ─── Client slot helpers ──────────────────────────────────────────
 
@@ -50,6 +52,7 @@ static void init_clients(void)
     for (int i = 0; i < TELNET_MAX_CLIENTS; i++) {
         s_client_fds[i] = -1;
         s_cmd_len[i]    = 0;
+        s_authed[i]     = false;
     }
     s_client_count = 0;
 }
@@ -62,6 +65,7 @@ static void remove_client(int fd)
         if (s_client_fds[i] == fd) {
             s_client_fds[i] = -1;
             s_cmd_len[i]    = 0;
+            s_authed[i]     = false;
             s_client_count--;
             if (s_client_count < 0) s_client_count = 0;
             ESP_LOGI(TAG, "Client disconnected (fd=%d), active=%d", fd, s_client_count);
@@ -76,7 +80,8 @@ static int add_client(int fd)
     for (int i = 0; i < TELNET_MAX_CLIENTS; i++) {
         if (s_client_fds[i] == -1) {
             s_client_fds[i] = fd;
-            s_cmd_len[i]    = 0;   // always reset — defensive against missed remove
+            s_cmd_len[i]    = 0;      // always reset — defensive against missed remove
+            s_authed[i]     = false;  // must re-authenticate on every connection
             s_client_count++;
             return i;
         }
@@ -135,7 +140,8 @@ static void telnet_server_task(void *pvParameters)
     ESP_LOGI(TAG, "Telnet server listening on port %d (max %d clients)",
              TELNET_PORT, TELNET_MAX_CLIENTS);
 
-    static const char banner[] =
+    static const char s_prompt[] = "\r\nPassword: ";
+    static const char s_banner[] =
         "\r\n"
         "╔══════════════════════════════════════════════╗\r\n"
         "║  ESP32-P4 Access Control Monitor             ║\r\n"
@@ -155,29 +161,39 @@ static void telnet_server_task(void *pvParameters)
             char client_ip[16];
             inet_ntoa_r(client_addr.sin_addr, client_ip, sizeof(client_ip));
 
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            int slot = add_client(client_fd);
-            if (slot < 0) {
-                // No slot — reject before releasing mutex so telnet_log
-                // doesn't try to write to this fd first
-                xSemaphoreGive(s_mutex);
-                ESP_LOGW(TAG, "Max clients reached, rejecting %s", client_ip);
-                const char *busy = "Server busy (max clients).\r\n";
-                send(client_fd, busy, strlen(busy), 0);
+            // ── Subnet whitelist: allow 10.10.4.0/22 only ────────────
+            uint32_t cip  = client_addr.sin_addr.s_addr;
+            uint32_t net  = inet_addr("10.10.4.0");
+            uint32_t smask = inet_addr("255.255.252.0");
+            if ((cip & smask) != (net & smask)) {
+                ESP_LOGW(TAG, "Rejected %s — not in allowed subnet", client_ip);
+                const char *denied = "Access denied.\r\n";
+                send(client_fd, denied, strlen(denied), 0);
                 close(client_fd);
             } else {
-                // Send banner under the same lock so it arrives before any
-                // concurrent telnet_log() output can interleave
-                send(client_fd, banner, sizeof(banner) - 1, 0);
-                xSemaphoreGive(s_mutex);
-                ESP_LOGI(TAG, "Telnet client #%d connected from %s, fd=%d",
-                         slot, client_ip, client_fd);
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                int slot = add_client(client_fd);
+                if (slot < 0) {
+                    xSemaphoreGive(s_mutex);
+                    ESP_LOGW(TAG, "Max clients reached, rejecting %s", client_ip);
+                    const char *busy = "Server busy (max clients).\r\n";
+                    send(client_fd, busy, strlen(busy), 0);
+                    close(client_fd);
+                } else {
+                    // Send password prompt — banner sent only after auth
+                    send(client_fd, s_prompt, sizeof(s_prompt) - 1, 0);
+                    xSemaphoreGive(s_mutex);
+                    ESP_LOGI(TAG, "Telnet client #%d connected from %s, fd=%d",
+                             slot, client_ip, client_fd);
+                }
             }
         }
 
         // ── Read client input, prune dead connections ─────────────
         char pending_ota_url[256] = {0};
         bool pending_reset        = false;
+        int  pending_send_banner  = -1;
+        int  pending_reject       = -1;
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         for (int i = 0; i < TELNET_MAX_CLIENTS; i++) {
@@ -197,13 +213,24 @@ static void telnet_server_task(void *pvParameters)
                     if (c == '\r' || c == '\n') {
                         s_cmd_buf[i][s_cmd_len[i]] = '\0';
                         if (s_cmd_len[i] == 0) continue;   // ignore blank lines
-                        // Only capture the first ota/reset command per loop tick
-                        if (strncmp(s_cmd_buf[i], "ota ", 4) == 0
-                                && pending_ota_url[0] == '\0') {
-                            strncpy(pending_ota_url, s_cmd_buf[i] + 4,
-                                    sizeof(pending_ota_url) - 1);
-                        } else if (strcmp(s_cmd_buf[i], "reset") == 0) {
-                            pending_reset = true;
+
+                        if (!s_authed[i]) {
+                            // treat this line as the password
+                            if (strcmp(s_cmd_buf[i], TELNET_PASSWORD) == 0) {
+                                s_authed[i]         = true;
+                                pending_send_banner = i;
+                            } else {
+                                pending_reject = i;
+                            }
+                        } else {
+                            // Only capture the first ota/reset command per loop tick
+                            if (strncmp(s_cmd_buf[i], "ota ", 4) == 0
+                                    && pending_ota_url[0] == '\0') {
+                                strncpy(pending_ota_url, s_cmd_buf[i] + 4,
+                                        sizeof(pending_ota_url) - 1);
+                            } else if (strcmp(s_cmd_buf[i], "reset") == 0) {
+                                pending_reset = true;
+                            }
                         }
                         s_cmd_len[i] = 0;
                     } else if (s_cmd_len[i] < (int)sizeof(s_cmd_buf[i]) - 1) {
@@ -232,6 +259,24 @@ static void telnet_server_task(void *pvParameters)
                 } else {
                     telnet_log("[OTA] FAILED: out of memory");
                 }
+            }
+        }
+
+        // ── Dispatch auth results outside mutex ───────────────────
+        if (pending_send_banner >= 0) {
+            int fd = s_client_fds[pending_send_banner];
+            if (fd >= 0)
+                send(fd, s_banner, sizeof(s_banner) - 1, 0);
+        }
+
+        if (pending_reject >= 0) {
+            int fd = s_client_fds[pending_reject];
+            if (fd >= 0) {
+                const char *msg = "Wrong password.\r\n";
+                send(fd, msg, strlen(msg), 0);
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                remove_client(fd);
+                xSemaphoreGive(s_mutex);
             }
         }
 
@@ -269,6 +314,7 @@ void telnet_log(const char *line)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < TELNET_MAX_CLIENTS; i++) {
         if (s_client_fds[i] < 0) continue;
+        if (!s_authed[i]) continue;   // no output until authenticated
         send(s_client_fds[i], line,   strlen(line), MSG_DONTWAIT);
         send(s_client_fds[i], "\r\n", 2,            MSG_DONTWAIT);
     }
