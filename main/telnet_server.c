@@ -7,6 +7,7 @@
  *
  * Command interface (type into the telnet session, end with Enter):
  *   ota <url>   – trigger OTA firmware update from HTTP URL
+ *   reset       – reboot the device
  */
 
 #include "telnet_server.h"
@@ -26,6 +27,7 @@
 #include "lwip/netdb.h"
 #include <fcntl.h>
 #include "esp_log.h"
+#include "esp_system.h"
 
 static const char *TAG = "telnet";
 
@@ -141,7 +143,7 @@ static void telnet_server_task(void *pvParameters)
         "║  Dual-core RISC-V @ 360MHz                   ║\r\n"
         "╚══════════════════════════════════════════════╝\r\n"
         "Connected. Log streaming...\r\n"
-        "Commands: ota <url>\r\n\r\n";
+        "Commands: ota <url> | reset\r\n\r\n";
 
     while (1) {
         // ── Accept new connection ─────────────────────────────────
@@ -175,6 +177,7 @@ static void telnet_server_task(void *pvParameters)
 
         // ── Read client input, prune dead connections ─────────────
         char pending_ota_url[256] = {0};
+        bool pending_reset        = false;
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         for (int i = 0; i < TELNET_MAX_CLIENTS; i++) {
@@ -193,11 +196,13 @@ static void telnet_server_task(void *pvParameters)
                     if (c == '\r') continue;
                     if (c == '\n') {
                         s_cmd_buf[i][s_cmd_len[i]] = '\0';
-                        // Only capture the first ota command per loop tick
+                        // Only capture the first ota/reset command per loop tick
                         if (strncmp(s_cmd_buf[i], "ota ", 4) == 0
                                 && pending_ota_url[0] == '\0') {
                             strncpy(pending_ota_url, s_cmd_buf[i] + 4,
                                     sizeof(pending_ota_url) - 1);
+                        } else if (strcmp(s_cmd_buf[i], "reset") == 0) {
+                            pending_reset = true;
                         }
                         s_cmd_len[i] = 0;
                     } else if (s_cmd_len[i] < (int)sizeof(s_cmd_buf[i]) - 1) {
@@ -227,6 +232,13 @@ static void telnet_server_task(void *pvParameters)
                     telnet_log("[OTA] FAILED: out of memory");
                 }
             }
+        }
+
+        // ── Dispatch reset outside mutex (telnet_log takes mutex) ─
+        if (pending_reset) {
+            telnet_log("[CMD] Rebooting...");
+            vTaskDelay(pdMS_TO_TICKS(200));   // let the log line flush to clients
+            esp_restart();
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
