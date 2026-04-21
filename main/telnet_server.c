@@ -193,9 +193,10 @@ static void telnet_server_task(void *pvParameters)
                 // Accumulate into per-client line buffer
                 for (int j = 0; j < r; j++) {
                     char c = rbuf[j];
-                    if (c == '\r') continue;
-                    if (c == '\n') {
+                    if (c == '\0') continue;   // telnet sends \r\0 on some clients
+                    if (c == '\r' || c == '\n') {
                         s_cmd_buf[i][s_cmd_len[i]] = '\0';
+                        if (s_cmd_len[i] == 0) continue;   // ignore blank lines
                         // Only capture the first ota/reset command per loop tick
                         if (strncmp(s_cmd_buf[i], "ota ", 4) == 0
                                 && pending_ota_url[0] == '\0') {
