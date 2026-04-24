@@ -47,6 +47,7 @@
 #  include "access_check.h"
 #endif
 #include "status_reporter.h"
+#include "ina219.h"
 
 static const char *TAG = "main";
 
@@ -329,6 +330,11 @@ static void print_heartbeat(void)
         telnet_logf("        Reaction (door open) — avg: %lu ms  min: %lu ms  max: %lu ms  n=%lu",
                     avg_ms, s_react_min_ms, s_react_max_ms, s_react_count);
     }
+    float ina_v, ina_i, ina_p;
+    if (ina219_read(&ina_v, &ina_i, &ina_p) == ESP_OK) {
+        telnet_logf("        5V rail: %.2fV   Current: %.0f mA   Power: %.2f W",
+                    ina_v, ina_i, ina_p);
+    }
     telnet_logf("──────────────────────────────────────────");
 
     s_last_heartbeat = now_ms();
@@ -411,6 +417,7 @@ void app_main(void)
         audio_play_grant();
         vTaskDelay(pdMS_TO_TICKS(300));
     }
+    ina219_init();   // non-fatal — skipped silently if not wired
 
     // ── 3. GM805 barcode scanner ─────────────────────────────────
     ESP_LOGI(TAG, "[3/6] GM805 barcode scanner (UART%d RX=GPIO%d TX=GPIO%d)",

@@ -10,6 +10,7 @@ idf_component_register(
         "ota.c"
         "status_reporter.c"
         "pa_access_check.c"
+        "ina219.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_driver_i2s

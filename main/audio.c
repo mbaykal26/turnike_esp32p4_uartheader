@@ -208,6 +208,11 @@ esp_err_t audio_init(void)
     return ret;
 }
 
+i2c_master_bus_handle_t audio_get_i2c_bus(void)
+{
+    return s_i2c_bus;
+}
+
 // Internal: write sine wave to I2S TX with fade in/out
 static void play_tone(int freq_hz, int duration_ms)
 {
