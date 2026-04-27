@@ -59,6 +59,11 @@
 #define I2C_SDA_PIN     GPIO_NUM_7
 #define I2C_SCL_PIN     GPIO_NUM_8
 #define ES8311_I2C_ADDR 0x18
+
+// INA219 current sensor — dedicated I2C bus (I2C_NUM_1) to avoid
+// conflict with esp_codec_dev which leaves I2C_NUM_0 in async state
+#define INA219_SDA_PIN  GPIO_NUM_6
+#define INA219_SCL_PIN  GPIO_NUM_3
 #define AUDIO_SAMPLE_RATE 16000
 
 // Tone definitions

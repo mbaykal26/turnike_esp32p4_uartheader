@@ -1,5 +1,5 @@
 #include "ina219.h"
-#include "audio.h"
+#include "config.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 
@@ -10,6 +10,7 @@ static const char *TAG = "ina219";
 #define REG_CURRENT      0x04
 #define REG_CALIBRATION  0x05
 
+static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 
 static esp_err_t write_reg(uint8_t reg, uint16_t val)
@@ -29,21 +30,50 @@ static esp_err_t read_reg(uint8_t reg, uint16_t *out)
 
 esp_err_t ina219_init(void)
 {
-    i2c_master_bus_handle_t bus = audio_get_i2c_bus();
-    if (!bus) {
-        ESP_LOGW(TAG, "I2C bus not ready — skipping INA219");
-        return ESP_ERR_INVALID_STATE;
+    // Own dedicated I2C bus on I2C_NUM_1 (GPIO6/GPIO3) — avoids conflict
+    // with esp_codec_dev which leaves I2C_NUM_0 in async state after init.
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port               = I2C_NUM_1,
+        .sda_io_num             = INA219_SDA_PIN,
+        .scl_io_num             = INA219_SCL_PIN,
+        .clk_source             = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt      = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    esp_err_t ret = i2c_new_master_bus(&bus_cfg, &s_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
+        return ret;
     }
 
-    i2c_device_config_t cfg = {
+    i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = INA219_ADDR,
         .scl_speed_hz    = 100000,
     };
-    esp_err_t ret = i2c_master_bus_add_device(bus, &cfg, &s_dev);
+    ret = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "add_device failed: %s", esp_err_to_name(ret));
+        i2c_del_master_bus(s_bus);
+        s_bus = NULL;
         return ret;
+    }
+
+    // Probe: scan bus to confirm INA219 is visible before writing
+    ESP_LOGI(TAG, "Scanning I2C bus for devices...");
+    int found = 0;
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        if (i2c_master_probe(s_bus, addr, 20) == ESP_OK) {
+            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
+            found++;
+        }
+    }
+    if (found == 0) {
+        ESP_LOGW(TAG, "  No I2C devices found — check VCC/GND/SDA/SCL wiring");
+        i2c_master_bus_rm_device(s_dev);
+        i2c_del_master_bus(s_bus);
+        s_dev = NULL; s_bus = NULL;
+        return ESP_ERR_NOT_FOUND;
     }
 
     // Cal = 0.04096 / (0.0001 A * 0.1 Ω) = 4096 → Current_LSB = 0.1 mA
@@ -51,11 +81,14 @@ esp_err_t ina219_init(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "INA219 not responding (check wiring): %s", esp_err_to_name(ret));
         i2c_master_bus_rm_device(s_dev);
+        i2c_del_master_bus(s_bus);
         s_dev = NULL;
+        s_bus = NULL;
         return ret;
     }
 
-    ESP_LOGI(TAG, "INA219 ready at 0x%02X", INA219_ADDR);
+    ESP_LOGI(TAG, "INA219 ready at 0x%02X (I2C_NUM_1 SDA=GPIO%d SCL=GPIO%d)",
+             INA219_ADDR, INA219_SDA_PIN, INA219_SCL_PIN);
     return ESP_OK;
 }
 
