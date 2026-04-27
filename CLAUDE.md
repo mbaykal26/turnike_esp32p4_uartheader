@@ -42,12 +42,31 @@ First build downloads `espressif/esp_codec_dev` from the component registry.
 | IP101 PHY | MDC | 31 | Ethernet management |
 | | MDIO | 52 | |
 | | RST | 51 | |
+| INA219 Sensor | SDA | 6 | I2C_NUM_1 — dedicated bus, NOT shared with ES8311 |
+| | SCL | 3 | |
+| | Vin+ | — | 5V source before sensor board |
+| | Vin- | — | 5V going to sensor board load |
+| | VCC | — | 3.3V |
 
 ### ⚠️ Known Pin Gotcha
 The Waveshare wiki labels DOUT=GPIO11 and DIN=GPIO9 — these are from the **ES8311 codec's perspective**.
 From the **ESP32 I2S driver's perspective**, it is the opposite:
 - ESP32 I2S `dout` (what the ESP32 **sends**) = **GPIO9** → goes into ES8311's DSDIN (DAC input)
 - Setting `dout=GPIO11` would push audio into the ADC output pin → **silence**
+
+### ⚠️ INA219 Must Use a Dedicated I2C Bus (NOT GPIO7/8)
+
+The INA219 current sensor **cannot share I2C_NUM_0 (GPIO7/GPIO8)** with the ES8311 audio codec.
+
+Root cause: `esp_codec_dev` leaves `I2C_NUM_0` in async transaction mode after `esp_codec_dev_open()`.
+Any subsequent synchronous `i2c_master_transmit()` call on that bus returns `ESP_ERR_INVALID_STATE`.
+This looks like a wiring problem but is a driver state conflict — rewiring to the same bus won't fix it.
+
+**Confirmed working:** INA219 on **I2C_NUM_1**, GPIO6 (SDA), GPIO3 (SCL).
+Defined in `config.h` as `INA219_SDA_PIN` / `INA219_SCL_PIN`.
+Driver in `main/ina219.c` calls `i2c_new_master_bus()` independently — no dependency on `audio.h`.
+
+See also: [INA219_WIRING.md](INA219_WIRING.md) for full wiring diagram and troubleshooting.
 
 ### ⚠️ UART Pin Conflict — Serial Monitor Goes Silent After Startup Beep
 GPIO37 and GPIO38 are the **console UART pins** (USB-UART bridge, used by `idf.py monitor`).
